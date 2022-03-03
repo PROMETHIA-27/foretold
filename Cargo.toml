@@ -1,0 +1,26 @@
+[package]
+name = "foretold"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bevy = "0.6"
+bevy_editor_pls = { git = "https://github.com/jakobhellermann/bevy_editor_pls.git" }
+bevy_egui = "0.11.1"
+bevy_mod_picking = "0.5.4"
+bevy_rapier3d = "0.12.1"
+if_chain = "1.0.2"
+image = { version = "*", features = ["png", "jpeg"] }
+rand = "0.8.5"
+
+[features]
+
+# Enable only a small amount of optimization in debug mode
+[profile.dev]
+opt-level = 1
+
+# Enable high optimizations for dependencies (incl. Bevy), but not for our code:
+[profile.dev.package."*"]
+opt-level = 3
