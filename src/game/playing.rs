@@ -5,9 +5,14 @@ pub const LEAN_BACK_ANGLE: [f32; 3] = [0.0, PI, 0.0];
 pub const LEAN_FORWARD_POS: [f32; 3] = [0.0, 1.3, 0.0];
 pub const LEAN_FORWARD_ANGLE: [f32; 3] = [0.0, PI / std::f32::consts::SQRT_2, PI / std::f32::consts::SQRT_2];
 
-pub fn movement(mut q: Query<(&mut LerpToTarget, &mut SlerpToTarget), With<Camera>>, input: Res<Input<KeyCode>>) {
+pub fn movement(mut q: Query<(&mut LerpToTarget, &mut SlerpToTarget), With<Camera>>, input: Res<Input<KeyCode>>, turn: Res<Turn>) {
     let lerp_ratio = 5.0;
     let slerp_ratio = 5.0;
+
+    match *turn {
+        Turn::Black | Turn::Red | Turn::BlackForesight | Turn::RedCorrection => (),
+        Turn::PreGame | Turn::PostGame => return,
+    };
 
     if input.just_pressed(KeyCode::W) {
         if let Ok((mut lerp, mut slerp)) = q.get_single_mut() {
@@ -32,19 +37,41 @@ pub fn movement(mut q: Query<(&mut LerpToTarget, &mut SlerpToTarget), With<Camer
 
 pub struct SelectedChecker(pub Option<Entity>);
 pub struct SelectedCheckerEvent(pub Entity);
+pub struct RedMove {
+    pub start: IVec2,
+    pub jumped: Vec<IVec2>,
+    pub jumps: Vec<IVec2>,
+    pub performed: bool,
+}
 
 pub fn selecting(
+    mut commands: Commands,
     mut events: EventReader<PickingEvent>, 
     checker_meshes: Query<&CheckerMesh>, 
-    mut checkers: Query<(&mut Checker, &mut LerpToTarget)>, 
+    mut checkers: Query<(Entity, &mut Checker)>,
     places: Query<&CheckerPlace>, 
     mut selected: ResMut<SelectedChecker>,
     mut selected_events: EventWriter<SelectedCheckerEvent>,
     mut map: ResMut<CheckerMap>,
     mut turn: ResMut<Turn>,
+    mut red_move: ResMut<RedMove>,
+    mut header: ResMut<Header>,
+    mut red_stack: ResMut<RedChipStack>,
+    mut black_stack: ResMut<BlackChipStack>,
+    input: Res<Input<KeyCode>>,
+    mut end_game: EventWriter<EndGameEvent>,
 ) {
-    if let Turn(Team::Black) = *turn {
-        // TODO: Complain at the player
+    if let Some(c) = selected.0 {
+        if let Ok((_, checker)) = checkers.get(c) {
+            if !checker.alive {
+                selected.0 = None;
+            }
+        }
+    }
+
+    if input.just_pressed(KeyCode::F3) {
+        end_game.send(EndGameEvent(Team::Red));
+        *turn = Turn::PostGame;
         return;
     }
 
@@ -58,32 +85,67 @@ pub fn selecting(
                             selected.0 = Some(mesh.0);
                             selected_events.send(SelectedCheckerEvent(mesh.0));
                         }
+                        match *turn {                            
+                            Turn::BlackForesight => {
+                                // Moving a checker
+                                if let Ok(place) = places.get(*entity) {
+                                    if !place.valid {
+                                        println!("Value at place: {:?}", map.get_place(place.pos));
+                                        header.0 = Cow::Borrowed("You cannot move that checker to that position");
+                                        return;
+                                    }
 
-                        // Moving a checker
-                        if_chain::if_chain!(
-                            if let Ok(place) = places.get(*entity);
-                            if let Some(checker_id) = selected.0;
-                            if let Ok((checker, lerp)) = checkers.get_mut(checker_id);
-                            then {
-                                move_piece(&mut map, checker_id, checker, lerp, place.pos);
+                                    if let Some(checker_id) = selected.0 {
+                                        if let Ok((_, checker)) = checkers.get_mut(checker_id) {
+                                            println!("Moving!");
 
-                                for pos in place.jumps.iter() {
-                                    let pos = *pos;
-
-                                    let target = map.get_place_checker(pos).unwrap();
-                                    let (checker, lerp) = checkers.get_mut(target).unwrap();
-
-                                    kill_piece(&mut map, checker, lerp);
+                                            *red_move = RedMove {
+                                                start: checker.pos, 
+                                                jumped: place.jumped.clone(),
+                                                jumps: place.jumps.clone(),
+                                                performed: false,
+                                            };
+            
+                                            selected.0 = None;
+                                            *turn = Turn::Black;
+                                        }
+                                    }
                                 }
+                            },
+                            Turn::RedCorrection => {
+                                if let Ok(place) = places.get(*entity) {
+                                    if !place.valid {
+                                        header.0 = Cow::Borrowed("You cannot move that checker to that position");
+                                        return;
+                                    }
 
-                                selected.0 = None;
-                                turn.0 = Team::Black;
-                            }
-                        );
+                                    if let Some(checker_id) = selected.0 {
+                                        if let Ok((_, checker)) = checkers.get_mut(checker_id) {
+                                            move_piece(&mut commands, &mut map, checker_id, checker, place.jumps.clone());
+            
+                                            for pos in place.jumped.iter() {
+                                                let pos = *pos;
+
+                                                let target = map.get_place_checker(pos)
+                                                .expect(&format!("Failed to get checker at pos {:?}", pos));
+                                                let (_, checker) = checkers.get_mut(target).unwrap();
+
+                                                println!("Kill piece 3!");
+                                                kill_piece(&mut commands, &mut map, checker, &mut red_stack, &mut black_stack);
+                                            }
+            
+                                            selected.0 = None;
+                                            *turn = Turn::BlackForesight;
+                                        }
+                                    }
+                                }
+                            },
+                            _ => ()
+                        }
                     },
                     SelectionEvent::JustDeselected(entity) => {
                         // Deselecting a checker
-                        if let Ok(_) = checkers.get(*entity) {
+                        if selected.0 == Some(*entity) {
                             selected.0 = None;
                         }
                     },
@@ -94,58 +156,109 @@ pub fn selecting(
     }
 }
 
+pub fn check_player_loss(
+    checkers: Query<&Checker>,
+    map: Res<CheckerMap>,
+    mut turn: ResMut<Turn>,
+    mut end_game: EventWriter<EndGameEvent>,
+) {
+    match *turn {
+        Turn::BlackForesight | Turn::RedCorrection => (),
+        _ => return,
+    }
+
+    let mut lost = true;
+    for checker in checkers.iter() {
+        if checker.team == Team::Red && checker.alive {
+            let pos = checker.pos;
+
+            let jumps = map.get_jumps(pos, Team::Red, checker.king);
+
+            if jumps.len() != 0 {
+                lost = false; 
+                break;
+            }
+
+            let moves = map.get_available_moves(pos, Team::Red, checker.king);
+
+            if moves.len() != 0 {
+                lost = false;
+                break;
+            }
+        }
+    }
+
+    if lost {
+        println!("Player lost the game");
+        end_game.send(EndGameEvent(Team::Black));
+        *turn = Turn::PostGame;
+    }
+}
+
 pub fn enable_valid_spaces(
     mut events: EventReader<SelectedCheckerEvent>,
-    mut places: Query<(&mut Visibility, &mut CheckerPlace)>,
-    checkers: Query<&Checker>,
+    mut places: Query<&mut CheckerPlace>,
+    checkers: Query<(Entity, &Checker)>,
     check_map: Res<CheckerMap>,
-    place_map: Res<PlaceMap>
+    place_map: Res<PlaceMap>,
+    mut header: ResMut<Header>,
 ) {
+    let mut checkers_with_jumps = vec![];
+    for (id, checker) in checkers.iter().filter(|(_, c)| c.team == Team::Red && c.alive) {
+        let jump_count = check_map.get_jumps(checker.pos, Team::Red, checker.king).len();
+        if jump_count > 0 {
+            checkers_with_jumps.push(id);
+        }
+    }
+
     for event in events.iter() {
-        for (mut visibility, mut place) in places.iter_mut() {
-            visibility.is_visible = false;
+        for mut place in places.iter_mut() {
+            place.valid = false;
             place.jumps = vec![];
         }
 
-        if let Ok(checker) = checkers.get(event.0) {
-            let pos = checker.pos;
+        let (id, checker) = checkers.get(event.0).unwrap();
 
-            let jumps = check_map.get_jumps(pos, Team::Red, false);
+        if checkers_with_jumps.len() > 0 && !checkers_with_jumps.contains(&id) {
+            header.0 = Cow::Borrowed("You must take any available jumps");
+            continue;
+        }
 
-            if jumps.len() == 0 {
-                let offsets = get_piece_offsets(Team::Red, false);
+        let pos = checker.pos;
 
-                for offset in offsets {                    
-                    let pos = pos + offset;
+        let jumps = check_map.get_jumps(pos, Team::Red, checker.king);
 
-                    if pos.x < 0 || pos.x > 7 || pos.y < 0 || pos.y > 7 {
-                        continue;
-                    }
+        if jumps.len() == 0 {
+            let moves = check_map.get_available_moves(pos, Team::Red, checker.king);
 
-                    if check_map.is_place_free(pos) {
-                        let (mut vis, _) = places.get_mut(place_map.get(pos)).unwrap();
-                        vis.is_visible = true;
-                    }
-                }
-            } else {
-                for (jumps, pos) in jumps {
-                    let (mut vis, mut place) = places.get_mut(place_map.get(pos)).unwrap();
-                    vis.is_visible = true;
-                    place.jumps = jumps;
-                }
+            for mov in moves {
+                let mut place = places.get_mut(place_map.get(mov)).unwrap();
+                place.valid = true;
+                place.jumped = vec![];
+                place.jumps = vec![mov];
+            }
+        } else {
+            for (jumped, jumps) in jumps {
+                let mut place = places.get_mut(place_map.get(*jumps.last().unwrap())).unwrap();
+                place.valid = true;
+                place.jumped = jumped;
+                place.jumps = jumps;
             }
         }
     }
 }
 
 pub fn enemy_play(
+    mut commands: Commands,
     mut turn: ResMut<Turn>,
-    mut checkers: Query<(Entity, &mut Checker, &mut LerpToTarget)>,
-    
+    mut checkers: Query<(Entity, &mut Checker)>,
     mut check_map: ResMut<CheckerMap>,
-    // mut place_map: ResMut<PlaceMap>,
+    mut events: EventWriter<EndGameEvent>,
+    mut red_stack: ResMut<RedChipStack>,
+    mut black_stack: ResMut<BlackChipStack>,
+    mut moved: ResMut<BlackHasMoved>,
 ) {
-    if let Turn(Team::Red) = *turn {
+    if *turn != Turn::Black || moved.0 {
         return;
     }
 
@@ -157,42 +270,43 @@ pub fn enemy_play(
 
     let mut best_jump: Option<(_, Vec<IVec2>, _)> = None;
 
-    for (entity, checker, _) in checkers.iter_mut() {
+    for (entity, checker) in checkers.iter_mut() {
         if checker.team == Team::Black && checker.alive == true {
-            let jumps = check_map.get_jumps(checker.pos, Team::Black, false);
-            for (hopped, dest) in jumps {
+            let jumps = check_map.get_jumps(checker.pos, Team::Black, checker.king);
+            for (hopped, hops) in jumps {
                 if best_jump.is_none() || hopped.len() > best_jump.as_ref().unwrap().1.len() {
-                    best_jump = Some((entity, hopped, dest));
+                    best_jump = Some((entity, hopped, hops));
                 }
             }
         }
     }
 
-    if let Some((checker_id, hopped, dest)) = best_jump {
-        let (_, checker, lerp) = checkers.get_mut(checker_id).unwrap();
+    if let Some((checker_id, jumped, jumps)) = best_jump {
+        let (_, checker) = checkers.get_mut(checker_id).unwrap();
         
-        move_piece(&mut check_map, checker_id, checker, lerp, dest);
+        move_piece(&mut commands, &mut check_map, checker_id, checker, jumps);
 
-        for pos in hopped {
+        for pos in jumped {
             let hopped_checker = check_map.get_place_checker(pos).unwrap();
-            let (_, checker, lerp) = checkers.get_mut(hopped_checker).unwrap();
+            let (_, checker) = checkers.get_mut(hopped_checker).unwrap();
             
-            kill_piece(&mut check_map, checker, lerp);
+            kill_piece(&mut commands, &mut check_map, checker, &mut red_stack, &mut black_stack);
         }
 
-        turn.0 = Team::Red;
+        moved.0 = true;
         return;
     }
     else {
-        for (checker_id, checker, lerp) in checkers.iter_mut() {
-            if checker.team == Team::Black {
-                let moves = check_map.get_available_moves(checker.pos, Team::Black, false);
+        // TODO: Actually pick a random checker
+        for (checker_id, checker) in checkers.iter_mut() {
+            if checker.team == Team::Black && checker.alive {
+                let moves = check_map.get_available_moves(checker.pos, Team::Black, checker.king);
                 if moves.len() > 0 {
                     let mov = moves[rand::thread_rng().gen_range(0..moves.len())];
 
-                    move_piece(&mut check_map, checker_id, checker, lerp, mov);
+                    move_piece(&mut commands, &mut check_map, checker_id, checker, vec![mov]);
 
-                    turn.0 = Team::Red;
+                    moved.0 = true;
                     return;
                 }
             }
@@ -201,23 +315,200 @@ pub fn enemy_play(
 
     // If we get here, Black loses because they cannot move
 
-    turn.0 = Team::Red;
+    println!("Black lost the game");
+    events.send(EndGameEvent(Team::Red));
+    *turn = Turn::PostGame;
 }
 
-fn move_piece(map: &mut CheckerMap, checker_id: Entity, mut checker: Mut<Checker>, mut lerp: Mut<LerpToTarget>, dest: IVec2) {
+pub struct BlackHasMoved(pub bool);
+
+pub fn animate_black_turn(
+    jumpers: Query<Entity, Or<(With<QuadJump>, With<MultiQuadJump>)>>,
+    mut moved: ResMut<BlackHasMoved>,
+    mut turn: ResMut<Turn>,
+) {
+    if *turn != Turn::Black || !moved.0 {
+        return;
+    }
+
+    let mut animating = false;
+    for _ in jumpers.iter() {
+        animating = true;
+    }
+
+    if !animating {
+        *turn = Turn::Red;
+        moved.0 = false;
+    }
+}
+
+pub fn animate_red_turn(
+    commands: Commands,
+    mut turn: ResMut<Turn>,
+    mut red_move: ResMut<RedMove>,
+    map: ResMut<CheckerMap>,
+    mut checkers: Query<(Entity, &mut Checker)>,
+    jumpers: Query<Entity, Or<(With<QuadJump>, With<MultiQuadJump>)>>,
+    red_stack: ResMut<RedChipStack>,
+    black_stack: ResMut<BlackChipStack>,
+) {
+    if *turn == Turn::Red {
+        if !red_move.performed {
+            let dptoc = do_player_turn_or_correction(commands, &red_move, map, &mut checkers, red_stack, black_stack);
+            if let None = dptoc {
+                *turn = Turn::RedCorrection;
+                println!("Turn invalidated");
+                return;
+            }
+
+            red_move.performed = true;
+            return;
+        }
+
+        let mut animating = false;
+        for _ in jumpers.iter() {
+            animating = true;
+        }
+
+        if !animating {
+            println!("Finished animating");
+            *turn = Turn::BlackForesight;
+        }
+    }
+}
+
+fn do_player_turn_or_correction(
+    mut commands: Commands,
+    red_move: &ResMut<RedMove>,
+    mut map: ResMut<CheckerMap>,
+    checkers: &mut Query<(Entity, &mut Checker)>,
+    mut red_stack: ResMut<RedChipStack>,
+    mut black_stack: ResMut<BlackChipStack>,
+) -> Option<()> {
+    let checker_id = map.get_place_checker(red_move.start)?;
+
+    let mut kills = vec![];
+
+    // TODO: Prevent jumps that bounce on spaces that have since been filled
+
+    // Verify all kills
+    for pos in red_move.jumped.iter() {
+        let pos = *pos;
+
+        let target = map.get_place_checker(pos)?;
+        let (target_id, _) = checkers.get_mut(target).ok()?;
+        kills.push(target_id);
+    }
+
+    // Verify move and perform move + kills
+    if map.is_place_free(*red_move.jumps.last().unwrap()) {
+        let (checker_id, checker) = checkers.get_mut(checker_id).ok()?;
+
+        move_piece(&mut commands, &mut map, checker_id, checker, red_move.jumps.clone());
+
+        for kill in kills {
+            let (_, target) = checkers.get_mut(kill).unwrap();
+
+            kill_piece(&mut commands, &mut map, target, &mut red_stack, &mut black_stack);
+        }
+    } else {
+        return None;
+    };
+
+    Some(())
+}
+
+fn move_piece(
+    commands: &mut Commands,
+    map: &mut CheckerMap,
+    checker_id: Entity,
+    mut checker: Mut<Checker>,
+    mut jumps: Vec<IVec2>,
+) {
+    let dest = *jumps.last().unwrap();
+
     map.set_place(checker.pos, None);
     map.set_place(dest, Some((checker_id, checker.team)));
+    jumps.insert(0, checker.pos);
+    commands.entity(checker_id).insert(MultiQuadJump::new(
+        jumps.windows(2)
+        .map(|jumps| QuadJump::new(
+            get_checkboard_pos(jumps[0]),
+            get_checkboard_pos(jumps[1]),
+            30.0,
+            0.25 
+        ))
+        .collect()
+    ));
     checker.pos = dest;
-    lerp.target = get_checkboard_pos(dest);
+
+    if (checker.team == Team::Black && dest.y == 0) || (checker.team == Team::Red && dest.y == 7) {
+        commands.entity(checker_id).insert(Kingify(true));
+    }
 }
 
-fn kill_piece(map: &mut CheckerMap, mut checker: Mut<Checker>, mut lerp: Mut<LerpToTarget>) {
+fn kill_piece(
+    commands: &mut Commands,
+    map: &mut CheckerMap, 
+    mut checker: Mut<Checker>,
+    red_stack: &mut ResMut<RedChipStack>,
+    black_stack: &mut ResMut<BlackChipStack>,
+) {
+    commands.entity(map.get_place_checker(checker.pos).unwrap())
+    .insert(QuadJump::new(
+        get_checkboard_pos(checker.pos),
+        get_stack_pos(match checker.team {
+            Team::Red => red_stack.height,
+            Team::Black => black_stack.height,
+        }, checker.team),
+        5.0,
+        0.5,
+    ));
+    
+    checker.alive = false;
     map.set_place(checker.pos, None);
     checker.pos = ivec2(-1, -1);
-    lerp.ratio = 0.1;
-    lerp.target = lerp.target.extend(0.0).xwz();
+
+    match checker.team {
+        Team::Red => red_stack.height += 1,
+        Team::Black => black_stack.height += 1,
+    };
 }
 
-fn make_king(mut checker: Mut<Checker>) {
+#[derive(Component)]
+pub struct Kingify(pub bool);
 
+pub fn make_kings(
+    mut commands: Commands,
+    mut checkers: Query<(Entity, &mut Checker, &Kingify)>,
+    models: Query<&CheckerMeshReference, Without<Checker>>, 
+    mut meshes: Query<&mut Visibility, Without<Checker>>, 
+) {
+    for (id, mut checker, kingify) in checkers.iter_mut() {
+        checker.king = kingify.0;
+        match kingify.0 {
+            true => {
+                meshes.get_mut(models.get(checker.model).unwrap().0).unwrap().is_visible = false;
+                meshes.get_mut(models.get(checker.king_model).unwrap().0).unwrap().is_visible = true;
+            },
+            false => {
+                meshes.get_mut(models.get(checker.model).unwrap().0).unwrap().is_visible = true;
+                meshes.get_mut(models.get(checker.king_model).unwrap().0).unwrap().is_visible = false;
+            }
+        }
+        commands.entity(id).remove::<Kingify>();
+    }
+}
+
+pub fn play_checker_noises(
+    audio: Res<Audio>,
+    click: Res<ClickNoise>,
+    mut events: EventReader<QuadLandEvent>,
+    checkers: Query<&Checker>
+) {
+    for landing in events.iter() {
+        if let Ok(_) = checkers.get(landing.0) {
+            audio.play(click.0.as_ref().unwrap().clone());
+        }
+    }
 }

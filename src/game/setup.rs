@@ -1,7 +1,18 @@
 use super::*;
 
-pub fn set_up_camera(mut commands: Commands) {
+#[derive(Component)]
+pub struct PlayerCamera;
 
+pub struct ClickNoise(pub Option<Handle<AudioSource>>);
+
+pub fn load_audio(
+    mut click: ResMut<ClickNoise>,
+    assets: Res<AssetServer>,
+) {
+    click.0 = Some(assets.load("sounds/click.wav")); 
+}
+
+pub fn set_up_camera(mut commands: Commands) {
     // Ended up messing around with projections and scooching thing around to get bevy_mod_raycast to actually pick up things that were apparently too close to the camera.
     let perspective_projection = PerspectiveProjection {
         fov: (PI / 4.0) * 0.75,
@@ -31,7 +42,8 @@ pub fn set_up_camera(mut commands: Commands) {
         .insert(SlerpToTarget::default())
         .insert_bundle(PickingCameraBundle::default());
     })
-    .insert(Name::new("Camera"));
+    .insert(Name::new("Camera"))
+    .insert(PlayerCamera);
 
     commands.spawn().insert(Name::new("Light"))
     .insert_bundle(PointLightBundle {
@@ -69,7 +81,9 @@ pub fn set_up_camera(mut commands: Commands) {
 }
 
 #[derive(Copy, Clone, Component, Debug, Default)]
-pub struct MakePickable;
+pub struct SetupModel(bool, bool);
+
+pub struct Table(pub Option<Entity>);
 
 pub fn set_up_checkerboard(
     mut commands: Commands, 
@@ -77,7 +91,8 @@ pub fn set_up_checkerboard(
     mut meshes: ResMut<Assets<Mesh>>,
     // mut materials: ResMut<Assets<StandardMaterial>>,
     mut check_map: ResMut<CheckerMap>,
-    mut place_map: ResMut<PlaceMap>
+    mut place_map: ResMut<PlaceMap>,
+    mut table_res: ResMut<Table>,
 ) {
     let table = assets.load("models/table.glb#Scene0");
     let checkboard = assets.load("models/checkboard.glb#Scene0");
@@ -88,13 +103,10 @@ pub fn set_up_checkerboard(
 
     let plane_mesh = meshes.add(shape::Plane { size: 0.061 }.into());
 
-    commands
+    let table = commands
     .spawn()
     .insert(Name::new("Table"))
     .insert(Transform::from_xyz(0., -1., 0.))
-    .with_delay(1.0, |c| {
-        c.insert(LerpToTarget { ratio: 5.0, target: Vec3::ZERO});
-    })
     .insert(GlobalTransform::default())
     .with_children(|b| {
         b.spawn_scene(table);
@@ -112,14 +124,14 @@ pub fn set_up_checkerboard(
 
                 let place = b.spawn()
                 .insert(Name::new(format!("CheckerPlace{}", i)))
-                .insert(CheckerPlace { pos: coord, jumps: vec![] })
+                .insert(CheckerPlace { pos: coord, jumps: vec![], jumped: vec![], valid: false })
                 .insert(Transform::from_xyz(pos.x, 0.025, pos.z))
                 .insert(GlobalTransform::default())
                 .insert(plane_mesh.clone())
                 // .insert(place_mat.clone())
                 // Visibility is part of bevy_mod_raycast's criteria for picking things for some reason.
                 // Using it to enable/disable picking
-                .insert(Visibility { is_visible: false })
+                .insert(Visibility::default())
                 .insert(ComputedVisibility::default())
                 .insert_bundle(PickableBundle::default())
                 .id();
@@ -127,16 +139,19 @@ pub fn set_up_checkerboard(
                 place_map.insert(coord, place);
             }
         });
-    });
+    }).id();
+
+    table_res.0 = Some(table);
 
     for i in 0..12 {
         let y = 1.;
-        let fall_speed = 5.0;
 
         let initial_coord = get_initial_checkboard_coord(i, Team::Black);
+        let initial_pos = get_checkboard_pos(initial_coord);
         
         let model = commands.spawn()
         .insert(Name::new("Model"))
+        .insert(SetupModel(false, false))
         .insert(Transform::default())
         .insert(GlobalTransform::default())
         .with_children(|b| {
@@ -144,6 +159,7 @@ pub fn set_up_checkerboard(
         }).id();
         let king = commands.spawn()
         .insert(Name::new("KingModel"))
+        .insert(SetupModel(false, true))
         .insert(Transform::default())
         .insert(GlobalTransform::default())
         .with_children(|b| {
@@ -153,22 +169,19 @@ pub fn set_up_checkerboard(
         let checker = commands.spawn()
         .insert(Name::new(format!("BlackChecker{}", i)))
         .insert(Checker { team: Team::Black, pos: initial_coord, alive: true, king: false, model, king_model: king })
-        .insert(Transform::from_xyz(0., y, 0.))
+        .insert(Transform::from_xyz(initial_pos.x, y, initial_pos.z))
         .insert(GlobalTransform::default())
-        .with_delay(3.0, move |c| {
-            c.insert(LerpToTarget { ratio: fall_speed, target: get_checkboard_pos(initial_coord) });
-        })
-        .add_child(model)
-        .add_child(king)
+        .push_children(&[model, king])
         .id();
         
         check_map.set_place(initial_coord, Some((checker, Team::Black)));
 
         let initial_coord = get_initial_checkboard_coord(i, Team::Red);
+        let initial_pos = get_checkboard_pos(initial_coord);
 
         let model = commands.spawn()
         .insert(Name::new("Model"))
-        .insert(MakePickable)
+        .insert(SetupModel(true, false))
         .insert(Transform::default())
         .insert(GlobalTransform::default())
         .with_children(|b| {
@@ -176,7 +189,7 @@ pub fn set_up_checkerboard(
         }).id();
         let king = commands.spawn()
         .insert(Name::new("KingModel"))
-        .insert(MakePickable)
+        .insert(SetupModel(true, true))
         .insert(Transform::default())
         .insert(GlobalTransform::default())
         .with_children(|b| {
@@ -186,41 +199,30 @@ pub fn set_up_checkerboard(
         let checker = commands.spawn()
         .insert(Name::new(format!("RedChecker{}", i)))
         .insert(Checker { team: Team::Red, pos: initial_coord, alive: true, king: false, model, king_model: king })
-        .insert(Transform::from_xyz(0., y, 0.).with_rotation(Quat::from_rotation_y(PI)))
+        .insert(Transform::from_xyz(initial_pos.x, y, initial_pos.z).with_rotation(Quat::from_rotation_y(PI)))
         .insert(GlobalTransform::default())
-        .with_delay(2.0, move |c| {
-            c
-            .insert(LerpToTarget { ratio: fall_speed, target: get_checkboard_pos(initial_coord) });
-        })
-        .add_child(model)
-        .add_child(king)
+        .push_children(&[model, king])
         .id();
         
         check_map.set_place(initial_coord, Some((checker, Team::Red)));
     }
 }
 
-#[derive(Default)]
-pub struct PickableCount(usize);
-
-pub fn should_add_pickables(count: Res<PickableCount>) -> bevy::ecs::schedule::ShouldRun {
-    if count.0 >= 12 {
-        return bevy::ecs::schedule::ShouldRun::No;
-    }
-    return bevy::ecs::schedule::ShouldRun::Yes;
-}
-
 // Need to get to parent after selection and this is easiest
 #[derive(Component)]
 pub struct CheckerMesh(pub Entity);
 
+// To get a mesh from a checker
+#[derive(Component)]
+pub struct CheckerMeshReference(pub Entity);
+
 pub fn set_up_checker_pickables(
     mut commands: Commands, 
-    models: Query<(Entity, &Children, &Name), (With<MakePickable>, Changed<Children>)>, 
+    models: Query<(Entity, &Children, &Parent, &SetupModel), Changed<Children>>, 
     parents: Query<&Children>, 
-    mut count: ResMut<PickableCount>
+    mut visibles: Query<&mut Visibility>,
 ) {
-    for (ent, children0, name) in models.iter() {
+    for (ent, children0, checker, setup) in models.iter() {
         if children0.len() == 0 { continue; }
 
         let child0 = children0.first().unwrap();
@@ -229,12 +231,22 @@ pub fn set_up_checker_pickables(
         let children2 = parents.get_component::<Children>(*child1).unwrap();
         let child2 = children2.first().unwrap();
 
-        commands
-        .entity(*child2)
-        .insert_bundle(PickableBundle::default())
-        .insert(CheckerMesh(ent));
-        count.0 += 1;
+        // Make red checkers pickable
+        if setup.0 {
+            commands
+            .entity(*child2)
+            .insert_bundle(PickableBundle::default())
+            .insert(CheckerMesh(checker.0));
+        }
 
-        commands.entity(ent).remove::<MakePickable>();
+        // Make kings invisible
+        if setup.1 {
+            visibles.get_mut(*child2).unwrap().is_visible = false;
+        }
+
+        commands.entity(ent)
+        .remove::<SetupModel>()
+        .insert(CheckerMeshReference(*child2));
     }
 }
+
